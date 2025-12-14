@@ -67,7 +67,7 @@ python inference_commandline_hf.py \
     --target_duration 5.0
 ```
 
-**Note**: If `--target_duration` is not specified, the model automatically estimates an appropriate duration based on phoneme analysis.
+**Note**: If `--target_duration` is not specified, the system automatically calculates an appropriate duration based on phoneme count and language-specific pacing rules. This calculation is approximate, so if the result isn't as expected, try specifying the duration manually.
 
 ## Inference
 
