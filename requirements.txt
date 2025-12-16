@@ -32,6 +32,7 @@ matplotlib
 # Inference / demos
 gradio
 torchcodec
+bitsandbytes
 
 # Duration estimation (phoneme/lang aware)
 langdetect

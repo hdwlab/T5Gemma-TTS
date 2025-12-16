@@ -82,7 +82,14 @@ def _load_resources(
         model_dir,
         trust_remote_code=True,
         dtype=torch.bfloat16,
-    ).to(device)
+        device_map="auto",
+    )
+    # Check if model is quantized (bitsandbytes) - if not, move to device manually
+    is_quantized = getattr(model, "is_loaded_in_8bit", False) or getattr(
+        model, "is_loaded_in_4bit", False
+    )
+    if not is_quantized and device != "cpu":
+        model = model.to(device)
     model.eval()
     cfg = model.config
 

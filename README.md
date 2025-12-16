@@ -135,7 +135,28 @@ python inference_gradio.py \
 - `--cpu_whisper`: run Whisper (auto-transcribe path) on CPU. Reduces VRAM use by roughly **5 GB**; transcription slows down.
 - `--low_vram`: preset that enables both flags and disables `torch.compile`.
 
-These switches don’t change model quality; they only trade GPU memory for a bit of latency on first runs.
+These switches don't change model quality; they only trade GPU memory for a bit of latency on first runs.
+
+#### Quantized Models
+
+Pre-quantized models are available for reduced VRAM usage:
+
+| Model | VRAM (approx.) | Notes |
+|-------|----------------|-------|
+| [T5Gemma-TTS-2b-2b](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b) | ~10.6 GB | Full precision (bfloat16) |
+| [T5Gemma-TTS-2b-2b-encoder-8bit](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b-encoder-8bit) | ~8.6 GB | 8-bit quantized encoder |
+| [T5Gemma-TTS-2b-2b-encoder-4bit](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b-encoder-4bit) | ~7.6 GB | 4-bit quantized encoder |
+
+Usage is the same as the full model - just change the model name:
+
+```bash
+python inference_gradio.py \
+    --model_dir Aratako/T5Gemma-TTS-2b-2b-encoder-8bit \
+    --low_vram \
+    --port 7860
+```
+
+**Note**: Only the encoder is quantized; the decoder remains in full precision to maintain audio quality. Quantized models require `bitsandbytes` and a CUDA GPU.
 
 ### Docker (Recommended for Windows users)
 

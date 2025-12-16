@@ -135,6 +135,27 @@ python inference_gradio.py \
 
 品質は変わらず、GPUメモリと速度のトレードオフだけが変わります。
 
+#### 量子化モデル
+
+VRAM使用量を削減した量子化モデルも利用可能です：
+
+| モデル | VRAM（目安） | 備考 |
+|-------|-------------|------|
+| [T5Gemma-TTS-2b-2b](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b) | 約10.6 GB | 通常版（bfloat16） |
+| [T5Gemma-TTS-2b-2b-encoder-8bit](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b-encoder-8bit) | 約8.6 GB | エンコーダー8bit量子化 |
+| [T5Gemma-TTS-2b-2b-encoder-4bit](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b-encoder-4bit) | 約7.6 GB | エンコーダー4bit量子化 |
+
+使い方は通常モデルと同じで、モデル名を変更するだけです：
+
+```bash
+python inference_gradio.py \
+    --model_dir Aratako/T5Gemma-TTS-2b-2b-encoder-8bit \
+    --low_vram \
+    --port 7860
+```
+
+**注意**: 音声品質を維持するため、エンコーダーのみ量子化し、デコーダーは通常精度のままです。量子化モデルの使用には`bitsandbytes`とCUDA GPUが必要です。
+
 ### Docker（Windowsユーザー向け推奨）
 
 Windowsで問題が発生する場合、Dockerを使用することで安定したLinux環境で実行できます：
