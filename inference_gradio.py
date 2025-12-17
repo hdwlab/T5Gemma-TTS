@@ -154,9 +154,11 @@ def run_inference(
     resources: dict,
     cut_off_sec: int = 100,
     lang: Optional[str] = None,
-) -> Tuple[int, np.ndarray]:
+    num_samples: int = 1,
+) -> list:
     """
-    Run TTS and return a (sample_rate, waveform) tuple for Gradio playback.
+    Run TTS and return a list of (sample_rate, waveform) tuples for Gradio playback.
+    When num_samples=1, returns a single tuple for backward compatibility.
     """
     used_seed = seed_everything(None if seed is None else int(seed))
 
@@ -240,30 +242,47 @@ def run_inference(
         multi_trial=[],
         repeat_prompt=repeat_prompt,
         return_frames=False,
+        num_samples=num_samples,
     )
 
-    # Take generated audio, move to CPU, convert to numpy for Gradio
-    gen_audio = gen_audio[0].detach().cpu()
-    if gen_audio.ndim == 2 and gen_audio.shape[0] == 1:
-        gen_audio = gen_audio.squeeze(0)
-    waveform = gen_audio.numpy()
-
-    max_abs = float(np.max(np.abs(waveform)))
-    rms = float(np.sqrt(np.mean(waveform**2)))
-    print(f"[Info] Generated audio stats -> max_abs: {max_abs:.6f}, rms: {rms:.6f}")
     print(f"[Info] Seed used for this run: {used_seed}")
 
-    return codec_audio_sr, waveform
+    # Handle single vs multiple samples
+    if num_samples == 1:
+        # Single sample: gen_audio is a tensor
+        audio = gen_audio[0].detach().cpu()
+        if audio.ndim == 2 and audio.shape[0] == 1:
+            audio = audio.squeeze(0)
+        waveform = audio.numpy()
+        max_abs = float(np.max(np.abs(waveform)))
+        rms = float(np.sqrt(np.mean(waveform**2)))
+        print(f"[Info] Generated audio stats -> max_abs: {max_abs:.6f}, rms: {rms:.6f}")
+        return [(codec_audio_sr, waveform)]
+    else:
+        # Multiple samples: gen_audio is a list of tensors
+        results = []
+        for i, audio in enumerate(gen_audio):
+            wav = audio[0].detach().cpu()
+            if wav.ndim == 2 and wav.shape[0] == 1:
+                wav = wav.squeeze(0)
+            waveform = wav.numpy()
+            max_abs = float(np.max(np.abs(waveform)))
+            rms = float(np.sqrt(np.mean(waveform**2)))
+            print(f"[Info] Sample {i+1} audio stats -> max_abs: {max_abs:.6f}, rms: {rms:.6f}")
+            results.append((codec_audio_sr, waveform))
+        return results
 
 
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
-def build_demo(resources, server_port: int, share: bool):
+def build_demo(resources, server_port: int, share: bool, max_num_samples: int = 256, cols_per_row: int = 8):
     description = (
         "Reference speech is optional. If provided without reference text, Whisper (large-v3-turbo) "
-        "will auto-transcribe and use it as the prompt text."
+        "will auto-transcribe and use it as the prompt text.\n\n"
+        "**Batch Generation**: Set 'Number of Samples' > 1 to generate multiple variations in parallel "
+        "(same input, different random samples). This is efficient as the encoder runs only once."
     )
 
     with gr.Blocks() as demo:
@@ -304,8 +323,38 @@ def build_demo(resources, server_port: int, share: bool):
             min_p_box = gr.Slider(label="min_p (0 = disabled)", minimum=0.0, maximum=1.0, step=0.05, value=0.0)
             temperature_box = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, step=0.05, value=0.8)
 
+        with gr.Row():
+            num_samples_slider = gr.Slider(
+                label="Number of Samples (batch generation)",
+                minimum=1,
+                maximum=max_num_samples,
+                step=1,
+                value=1,
+                info="Generate multiple variations in parallel with different random samples",
+            )
+
         generate_button = gr.Button("Generate")
-        output_audio = gr.Audio(label="Generated Audio", type="numpy", interactive=False)
+
+        # Create multiple audio outputs in a grid layout (cols_per_row columns)
+        output_audios = []
+        num_rows = (max_num_samples + cols_per_row - 1) // cols_per_row
+        with gr.Column():
+            for row_idx in range(num_rows):
+                with gr.Row():
+                    for col_idx in range(cols_per_row):
+                        i = row_idx * cols_per_row + col_idx
+                        if i >= max_num_samples:
+                            break
+                        audio = gr.Audio(
+                            label=f"#{i+1}",
+                            type="numpy",
+                            interactive=False,
+                            visible=(i == 0),
+                            show_label=True,
+                            scale=1,
+                            min_width=80,
+                        )
+                        output_audios.append(audio)
 
         def gradio_inference(
             reference_speech,
@@ -317,12 +366,15 @@ def build_demo(resources, server_port: int, share: bool):
             min_p,
             temperature,
             seed,
+            num_samples,
         ):
             dur = float(target_duration) if str(target_duration).strip() not in {"", "None", "none"} else None
             seed_val = None
             if str(seed).strip() not in {"", "None", "none"}:
                 seed_val = int(float(seed))
-            sr, wav = run_inference(
+
+            num_samples = int(num_samples)
+            results = run_inference(
                 reference_speech=reference_speech,
                 reference_text=reference_text,
                 target_text=target_text,
@@ -333,8 +385,19 @@ def build_demo(resources, server_port: int, share: bool):
                 temperature=temperature,
                 seed=seed_val,
                 resources=resources,
+                num_samples=num_samples,
             )
-            return (sr, wav)
+
+            # Prepare outputs for all audio components
+            outputs = []
+            for i in range(max_num_samples):
+                if i < len(results):
+                    # Return audio data and make visible
+                    outputs.append(gr.update(value=results[i], visible=True))
+                else:
+                    # Hide unused components
+                    outputs.append(gr.update(value=None, visible=False))
+            return outputs
 
         generate_button.click(
             fn=gradio_inference,
@@ -348,8 +411,9 @@ def build_demo(resources, server_port: int, share: bool):
                 min_p_box,
                 temperature_box,
                 seed_box,
+                num_samples_slider,
             ],
-            outputs=[output_audio],
+            outputs=output_audios,
         )
 
     demo.launch(server_name="0.0.0.0", server_port=server_port, share=share, debug=True)

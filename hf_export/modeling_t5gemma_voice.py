@@ -526,7 +526,7 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
             "PM-RoPE cross-attention enabled for %d decoder layers.", len(new_layers)
         )
 
-    # Generation-style inference (identical to original implementation)
+    # Generation-style inference with batch support for multiple samples
     @torch.inference_mode()
     def inference_tts(
         self,
@@ -541,8 +541,19 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         stop_repetition: int = 3,
         silence_tokens: List[int] = None,
         multi_trial: List[int] = None,
+        num_samples: int = 1,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run TTS inference.
+
+        Args:
+            num_samples: Number of samples to generate in parallel with different
+                random seeds. Input x and y are duplicated internally.
+
+        Returns:
+            Tuple of (concat_frames, gen_frames) with shape [num_samples, 1, T].
+        """
         if getattr(self.args, "n_codebooks", 1) != 1:
             raise ValueError("XCodec2 inference expects n_codebooks=1.")
 
@@ -555,9 +566,12 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         eog_inference = (
             self.args.eos if getattr(self.args, "eos", -1) > 0 else self.args.eog
         )
-        batch_size = x.shape[0]
-        assert batch_size == 1, "Current implementation only supports batch size 1."
 
+        # Input validation: expect batch_size=1, then expand to num_samples
+        assert x.shape[0] == 1, "Input batch size must be 1; use num_samples for parallel generation."
+        batch_size = num_samples
+
+        # Encoder runs once (same input for all samples)
         x_padding_mask = make_pad_mask(x_lens).to(device)
         encoder_attention_mask = (~x_padding_mask).long()
         if getattr(self.args, "use_pm_rope", 1):
@@ -577,13 +591,25 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 attention_mask=encoder_attention_mask,
                 position_ids=encoder_position_ids,
             )
-        memory = encoder_outputs.last_hidden_state
+        memory = encoder_outputs.last_hidden_state  # [1, T_enc, D]
+
+        # Expand encoder outputs for batch
+        if batch_size > 1:
+            memory = memory.expand(batch_size, -1, -1).contiguous()
+            encoder_attention_mask = encoder_attention_mask.expand(batch_size, -1).contiguous()
+            if encoder_position_ids is not None:
+                encoder_position_ids = encoder_position_ids.expand(batch_size, -1).contiguous()
 
         if self.args.special_first:
             y = y + int(self.args.n_special)
-        y = y.transpose(2, 1).contiguous()  # [B, 1, T]
+        y = y.transpose(2, 1).contiguous()  # [1, 1, T]
         y_len = y.shape[-1]
         prompt_frames = kwargs.get("prompt_frames", y_len)
+
+        # Expand y for batch
+        if batch_size > 1:
+            y = y.expand(batch_size, -1, -1).contiguous()
+
         target_total = None
         cutoff_limit = None
         if tgt_y_lens is not None:
@@ -625,7 +651,6 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         est_total = max(est_total, current_length)
 
         # Pre-allocate attention mask buffer to avoid per-step tensor creation.
-        # Use est_total + safety margin to avoid reallocation.
         max_gen_length = est_total + int(getattr(self.args, "encodec_sr", 50) * 10)
         full_dec_attention_mask = torch.ones(
             (batch_size, max_gen_length), dtype=torch.long, device=device
@@ -635,12 +660,12 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         pm_kwargs = {}
         decoder_position_ids_full = None
         if getattr(self.args, "use_pm_rope", 1):
-            base = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(
-                0
-            )
+            base = torch.arange(cur_len, device=device, dtype=torch.float32).unsqueeze(0)
             decoder_position_ids_full = (
                 base / max(1, est_total - 1) * self.progress_scale
             )
+            if batch_size > 1:
+                decoder_position_ids_full = decoder_position_ids_full.expand(batch_size, -1).contiguous()
             pm_kwargs["position_ids"] = decoder_position_ids_full
             pm_kwargs["pm_decoder_position_ids"] = decoder_position_ids_full
             pm_kwargs["pm_encoder_position_ids"] = encoder_position_ids
@@ -655,34 +680,31 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
             use_cache=True,
             **pm_kwargs,
         )
-        last_hidden = decoder_outputs.last_hidden_state[:, -1:, :]
+        last_hidden = decoder_outputs.last_hidden_state[:, -1:, :]  # [B, 1, D]
         past_key_values = decoder_outputs.past_key_values
 
-        generated_tokens: List[torch.Tensor] = []
+        # Batch generation state
+        generated_tokens: List[torch.Tensor] = []  # List of [B] tensors
         cur_num_gen = 0
-        prev_token = -1
-        consec_silence_count = 0
+        prev_tokens = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        consec_silence_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         silence_set = set(silence_tokens)
 
-        def sample_helper(
-            logits,
-            top_k,
-            top_p,
-            min_p,
-            temperature,
-            prev_token,
-            consec_silence_count,
-            stop_repetition,
-            silence_tokens,
-            cur_num_gen,
-            current_length,
-            target_total,
-            prompt_offset,
-        ):
+        # Compute budgets once
+        first_input_len = int(x_lens[0].item())
+        text_mode = getattr(self.args, "text_input_type", "text") == "text"
+        frames_per_token_cap = getattr(self.args, "text_guard_frames_per_token", 0)
+        extra_cutoff_val = getattr(self.args, "extra_cutoff", 5)
+
+        while not finished.all():
+            logits = self.predict_layer[0](last_hidden).squeeze(1)  # [B, V]
+
             effective_length = max(0, current_length - prompt_offset)
-            logits_adjust = logits
+
+            # Adjust logits for all samples
             if effective_length == 0:
-                logits_adjust[eog_inference] = -1e9
+                logits[:, eog_inference] = -1e9
 
             if isinstance(top_k, list):
                 kk = top_k[min(len(top_k) - 1, cur_num_gen)]
@@ -690,105 +712,84 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 kk = top_k
 
             if cur_num_gen <= self.args.encodec_sr // 5:
-                logits_adjust[eog_inference] = -10000.0
+                logits[:, eog_inference] = -10000.0
 
-            if (
-                stop_repetition > 0
-                and prev_token in silence_tokens
-                and consec_silence_count > stop_repetition
-            ):
-                if logits_adjust[prev_token] < 0:
-                    logits_adjust[prev_token] = logits_adjust[prev_token] * (
-                        consec_silence_count - (stop_repetition - 1)
-                    )
-                else:
-                    logits_adjust[prev_token] = logits_adjust[prev_token] / (
-                        consec_silence_count - (stop_repetition - 1)
-                    )
+            # Stop repetition penalty (vectorized)
+            if stop_repetition > 0 and silence_tokens:
+                for sil_tok in silence_tokens:
+                    mask = (prev_tokens == sil_tok) & (consec_silence_counts > stop_repetition)
+                    if mask.any():
+                        penalty = (consec_silence_counts[mask] - (stop_repetition - 1)).float()
+                        neg_mask = logits[mask, sil_tok] < 0
+                        logits[mask, sil_tok] = torch.where(
+                            neg_mask,
+                            logits[mask, sil_tok] * penalty,
+                            logits[mask, sil_tok] / penalty,
+                        )
 
-            token = topk_sampling(
-                logits_adjust,
+            # Sample tokens for all batch elements
+            tokens = topk_sampling(
+                logits,
                 top_k=kk,
                 top_p=top_p,
                 min_p=min_p,
                 temperature=temperature,
-            )
-            token_id = int(token.item())
+            ).squeeze(-1)  # [B]
 
-            should_force_stop = (
-                token_id == eog_inference or int(torch.argmax(logits).item()) == eog_inference
-            )
+            # Force stop conditions
+            should_force_stop = (tokens == eog_inference) | (logits.argmax(dim=-1) == eog_inference)
 
-            text_mode = getattr(self.args, "text_input_type", "text") == "text"
-            frames_per_token_cap = getattr(self.args, "text_guard_frames_per_token", 0)
-            first_input_len = int(x_lens[0].item())
             if not text_mode:
-                token_budget = first_input_len * max(
-                    1, int(self.args.encodec_sr) // 4
-                )
-                should_force_stop = should_force_stop or (
-                    effective_length > token_budget
-                )
+                token_budget = first_input_len * max(1, int(self.args.encodec_sr) // 4)
+                should_force_stop |= (effective_length > token_budget)
             elif frames_per_token_cap > 0:
                 token_budget = max(1, first_input_len) * frames_per_token_cap
-                should_force_stop = should_force_stop or (
-                    effective_length > token_budget
+                should_force_stop |= (effective_length > token_budget)
+
+            if target_total is not None:
+                time_budget = target_total - prompt_offset + int(self.args.encodec_sr) * extra_cutoff_val
+                if cur_num_gen > time_budget:
+                    should_force_stop[:] = True
+
+            # Apply force stop
+            tokens = torch.where(should_force_stop, torch.full_like(tokens, eog_inference), tokens)
+
+            # Update silence tracking
+            for sil_tok in silence_tokens:
+                is_same_silence = (tokens == sil_tok) & (prev_tokens == sil_tok)
+                consec_silence_counts = torch.where(
+                    is_same_silence,
+                    consec_silence_counts + 1,
+                    torch.where(tokens == sil_tok, torch.ones_like(consec_silence_counts), torch.zeros_like(consec_silence_counts))
                 )
 
-            time_budget_exceeded = target_total is not None and cur_num_gen > (
-                target_total
-                - prompt_offset
-                + int(self.args.encodec_sr) * getattr(self.args, "extra_cutoff", 5)
-            )
-            if should_force_stop or time_budget_exceeded:
-                token_id = eog_inference
+            prev_tokens = tokens.clone()
 
-            if token_id in silence_set and token_id == prev_token:
-                consec_silence_count += 1
-            else:
-                consec_silence_count = 0
-            prev_token = token_id
-            return token_id, prev_token, consec_silence_count
+            # Mark finished samples
+            newly_finished = tokens == eog_inference
+            finished |= newly_finished
 
-        while True:
-            logits = self.predict_layer[0](last_hidden).squeeze(0).squeeze(0)
-            token_id, prev_token, consec_silence_count = sample_helper(
-                logits,
-                top_k,
-                top_p,
-                min_p,
-                temperature,
-                prev_token,
-                consec_silence_count,
-                stop_repetition,
-                silence_tokens,
-                cur_num_gen,
-                current_length,
-                target_total,
-                prompt_offset,
-            )
+            # Store tokens (use EOG for already-finished samples)
+            store_tokens = torch.where(finished & ~newly_finished, torch.full_like(tokens, eog_inference), tokens)
+            generated_tokens.append(store_tokens)
 
-            token_tensor = torch.tensor([[token_id]], device=device, dtype=torch.long)
-            generated_tokens.append(token_tensor.squeeze(0))
             cur_num_gen += 1
             current_length += 1
 
-            if token_id == eog_inference:
+            if finished.all():
                 break
 
-            samples_emb = self.audio_embedding[0](token_tensor)
+            # Embed next tokens
+            samples_emb = self.audio_embedding[0](tokens.unsqueeze(1))  # [B, 1, D]
             samples_emb = self.audio_dropout(samples_emb)
 
             if getattr(self.args, "use_pm_rope", 1):
                 new_pos_value = (
-                    float(current_length - 1)
-                    / max(1, est_total - 1)
-                    * self.progress_scale
+                    float(current_length - 1) / max(1, est_total - 1) * self.progress_scale
                 )
                 new_pos_value = min(new_pos_value, self.progress_scale)
-                # Avoid torch.cat: create single-token position tensor directly
-                pos_1 = torch.tensor(
-                    [[new_pos_value]], device=device, dtype=torch.float32
+                pos_1 = torch.full(
+                    (batch_size, 1), new_pos_value, device=device, dtype=torch.float32
                 )
                 pm_kwargs = {
                     "position_ids": pos_1,
@@ -798,8 +799,6 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
             else:
                 pm_kwargs = {"position_ids": None}
 
-            # With KV cache, decoder only needs mask length covering all seen tokens.
-            # Reuse pre-allocated buffer slice instead of creating new tensor each step.
             decoder_outputs = self.decoder_module(
                 inputs_embeds=samples_emb,
                 attention_mask=full_dec_attention_mask[:, :current_length],
@@ -812,16 +811,23 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
             past_key_values = decoder_outputs.past_key_values
             last_hidden = decoder_outputs.last_hidden_state
 
+        # Stack generated tokens: [B, T_gen]
         if generated_tokens:
-            generated_tensor = torch.stack(generated_tokens, dim=1)  # [1, T_gen]
+            generated_tensor = torch.stack(generated_tokens, dim=1)
         else:
-            generated_tensor = torch.zeros((1, 0), device=device, dtype=torch.long)
+            generated_tensor = torch.zeros((batch_size, 0), device=device, dtype=torch.long)
 
+        # Trim each sample to its actual length (up to first EOG)
+        # For simplicity, keep rectangular tensor but mask with EOG
+        # The caller can trim per-sample if needed
+
+        # Build result tensors
+        # y is [B, 1, T_prompt], generated_tensor is [B, T_gen]
         expected_y_len = y_len + generated_tensor.shape[1]
-        res = torch.cat([y[0], generated_tensor], dim=1).unsqueeze(0)
-        assert res.shape == torch.Size((1, 1, expected_y_len))
+        res = torch.cat([y[:, 0, :], generated_tensor], dim=1).unsqueeze(1)  # [B, 1, T_total]
 
         if self.args.special_first:
             res = res - int(self.args.n_special)
             generated_tensor = generated_tensor - int(self.args.n_special)
-        return res, generated_tensor.unsqueeze(0)
+
+        return res, generated_tensor.unsqueeze(1)  # [B, 1, T_gen]

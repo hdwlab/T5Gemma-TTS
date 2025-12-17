@@ -12,11 +12,21 @@ Training and inference code for **T5Gemma-TTS**, a multilingual Text-to-Speech m
 
 For model details, audio samples, and technical information, please refer to the [model card](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b).
 
+## Updates
+
+**2025/12/17**
+- Added batch inference support for generating multiple audio variations in parallel from the same input (Gradio UI)
+- Added quantized model support (8-bit/4-bit encoder quantization) for reduced VRAM usage
+- Added `--low_vram` option (CPU offloading for XCodec2/Whisper) for memory-constrained environments
+- Added Apple Silicon (MPS) support
+- Added PyTorch 2.9+ compatibility
+
 ## Features
 
 - **Multilingual TTS**: Supports English, Chinese, and Japanese
 - **Voice Cloning**: Zero-shot voice cloning from reference audio
 - **Duration Control**: Explicit control over generated audio length (auto-estimation when not specified)
+- **Batch Generation**: Generate multiple audio variations in parallel from the same input (Gradio UI)
 - **Flexible Training**: Full training, fine-tuning, and LoRA fine-tuning support
 - **Multiple Inference Options**: Command-line, HuggingFace format, and Gradio UI
 
@@ -128,6 +138,14 @@ python inference_gradio.py \
     --xcodec2_sample_rate 16000 \
     --port 7860
 ```
+
+#### Batch Generation
+
+Generate multiple audio variations in parallel from the same input with different random samples. This is efficient as the encoder runs only once - only the decoder runs in batch.
+
+- Use the **"Number of Samples"** slider (1-256) in the Gradio UI
+- Results are displayed in an 8-column grid layout
+- Useful for generating multiple candidates and selecting the best one
 
 #### Low-VRAM options (Gradio / HF inference)
 

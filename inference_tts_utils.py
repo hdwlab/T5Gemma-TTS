@@ -173,6 +173,7 @@ def inference_one_sample(
     repeat_prompt=0,
     multi_trial=None,
     return_frames=False,
+    num_samples: int = 1,
 ):
     multi_trial = multi_trial or []
 
@@ -306,7 +307,7 @@ def inference_one_sample(
     stime = time.time()
     assert multi_trial == []
     if not quiet:
-        logging.info("running inference with batch size 1")
+        logging.info(f"running inference with num_samples={num_samples}")
 
     concat_frames, gen_frames = model.inference_tts(
         text_tokens.to(device),
@@ -320,82 +321,92 @@ def inference_one_sample(
         stop_repetition=decode_config["stop_repetition"],
         silence_tokens=silence_tokens,
         prompt_frames=prompt_frames,
+        num_samples=num_samples,
     )
 
     inference_time = time.time() - stime
     num_generated_tokens = gen_frames.shape[-1]
-    tokens_per_sec = num_generated_tokens / inference_time if inference_time > 0 else 0.0
+    tokens_per_sec = num_generated_tokens * num_samples / inference_time if inference_time > 0 else 0.0
     audio_duration = num_generated_tokens / codec_sr
-    real_time_factor = audio_duration / inference_time if inference_time > 0 else 0.0
+    real_time_factor = audio_duration * num_samples / inference_time if inference_time > 0 else 0.0
 
     if not quiet:
-        logging.info(f"inference on one sample take: {inference_time:.4f} sec.")
+        logging.info(f"inference on {num_samples} sample(s) took: {inference_time:.4f} sec.")
         logging.info(
             f"generated encoded_frames.shape: {gen_frames.shape}, "
-            f"which is {audio_duration:.2f} sec."
+            f"which is {audio_duration:.2f} sec per sample."
         )
     print(f"[Speed] {tokens_per_sec:.2f} tokens/s | RTF: {real_time_factor:.2f}x | "
-          f"Generated {num_generated_tokens} tokens in {inference_time:.2f}s")
+          f"Generated {num_generated_tokens} tokens x {num_samples} samples in {inference_time:.2f}s")
 
-    def _strip_sep_and_eos(frames: torch.Tensor, sep_token: Optional[int], eos_token: Optional[int]) -> torch.Tensor:
-        # keep all by default, then drop sep/eos if provided
-        mask = torch.ones_like(frames, dtype=torch.bool)
-        if sep_token is not None:
-            mask &= frames.ne(sep_token)
-        if eos_token is not None:
-            mask &= frames.ne(eos_token)
-        if mask.all():
-            return frames
-        keep_counts = mask.sum(dim=2)
-        if not torch.all(keep_counts.eq(keep_counts[..., :1])):
-            min_len = int(keep_counts.min().item())
-            cleaned_batches = []
-            for b in range(frames.shape[0]):
-                per_codebook = []
-                for k in range(frames.shape[1]):
-                    vals = frames[b, k][mask[b, k]]
-                    if vals.numel() < min_len:
-                        pad_val = sep_token if sep_token is not None else 0
-                        vals = torch.nn.functional.pad(vals, (0, min_len - vals.numel()), value=pad_val)
-                        vals = vals[:min_len]
-                    else:
-                        vals = vals[:min_len]
-                    per_codebook.append(vals.unsqueeze(0))
-                cleaned_batches.append(torch.cat(per_codebook, dim=0).unsqueeze(0))
-            return torch.cat(cleaned_batches, dim=0).to(frames.device)
-        new_len = int(keep_counts[0, 0].item())
-        cleaned_vals = frames[mask]
-        return cleaned_vals.view(frames.size(0), frames.size(1), new_len)
+    def _strip_sep_and_eos_per_sample(frames: torch.Tensor, sep_token: Optional[int], eos_token: Optional[int]):
+        """Strip sep/eos tokens per sample, returning list of variable-length tensors."""
+        results = []
+        for b in range(frames.shape[0]):
+            sample_frames = frames[b:b+1]  # [1, K, T]
+            mask = torch.ones_like(sample_frames, dtype=torch.bool)
+            if sep_token is not None:
+                mask &= sample_frames.ne(sep_token)
+            if eos_token is not None:
+                mask &= sample_frames.ne(eos_token)
+            if mask.all():
+                results.append(sample_frames)
+            else:
+                # Find valid length for this sample
+                valid_len = int(mask[0, 0].sum().item())
+                cleaned = sample_frames[0, 0][mask[0, 0]][:valid_len]
+                results.append(cleaned.view(1, 1, -1))
+        return results
 
-    concat_frames = _strip_sep_and_eos(concat_frames, y_sep_token, eos_token)
-    gen_frames = _strip_sep_and_eos(gen_frames, y_sep_token, eos_token)
+    # Process frames per sample to handle variable lengths
+    concat_frames_list = _strip_sep_and_eos_per_sample(concat_frames, y_sep_token, eos_token)
+    gen_frames_list = _strip_sep_and_eos_per_sample(gen_frames, y_sep_token, eos_token)
 
-    concat_sample = None
-    if has_reference_audio:
-        try:
-            concat_sample = audio_tokenizer.decode(concat_frames)
-        except Exception as exc:
-            logging.warning(f"Failed to decode concatenated prompt audio: {exc}")
+    # Decode each sample
+    concat_samples = []
+    gen_samples = []
 
-    gen_sample = audio_tokenizer.decode(gen_frames)
+    for i in range(num_samples):
+        # Decode generated audio
+        gen_sample = audio_tokenizer.decode(gen_frames_list[i])
+        gen_samples.append(gen_sample)
 
-    if concat_sample is None:
-        concat_sample = gen_sample
+        # Decode concatenated audio if reference exists
+        if has_reference_audio:
+            try:
+                concat_sample = audio_tokenizer.decode(concat_frames_list[i])
+                concat_samples.append(concat_sample)
+            except Exception as exc:
+                logging.warning(f"Failed to decode concatenated prompt audio for sample {i}: {exc}")
+                concat_samples.append(gen_sample)
+        else:
+            concat_samples.append(gen_sample)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
+    # For backward compatibility: if num_samples=1, return single tensors
+    if num_samples == 1:
+        if return_frames:
+            return (
+                concat_samples[0],
+                gen_samples[0],
+                concat_frames_list[0].detach().cpu(),
+                gen_frames_list[0].detach().cpu(),
+            )
+        return concat_samples[0], gen_samples[0]
+
+    # For multiple samples, return lists
     if return_frames:
         return (
-            concat_sample,
-            gen_sample,
-            concat_frames.detach().cpu(),
-            gen_frames.detach().cpu(),
+            concat_samples,
+            gen_samples,
+            [f.detach().cpu() for f in concat_frames_list],
+            [f.detach().cpu() for f in gen_frames_list],
         )
-
-    return concat_sample, gen_sample
+    return concat_samples, gen_samples
 
 
 # ==== Whisper transcription (transformers, MPS compatible, no ffmpeg) ====

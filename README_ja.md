@@ -10,11 +10,21 @@ Encoder-Decoder LLMアーキテクチャに基づく多言語Text-to-Speechモ�
 
 モデルの詳細、音声サンプル、技術情報については、[モデルカード](https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b)を参照してください。
 
+## 更新履歴
+
+**2025/12/17**
+- 同一入力から複数の音声バリエーションを並列生成するバッチ推論機能を追加（Gradio UI）
+- VRAM使用量削減のための量子化モデル（8-bit/4-bitエンコーダ量子化）に対応
+- メモリ制約環境向けの`--low_vram`オプション（XCodec2/WhisperのCPUオフロード）を追加
+- Apple Silicon（MPS）に対応
+- PyTorch 2.9以降との互換性を追加
+
 ## 特徴
 
 - **Multilingual TTS**: 英語、中国語、日本語をサポート
 - **Voice Cloning**: 参照音声からのzero-shot voice cloningをサポート
 - **Duration Control**: 生成音声の長さを明示的に制御可能（未指定時は自動推定）
+- **Batch Generation**: 同一入力から複数の音声バリエーションを並列生成（Gradio UI）
 - **Flexible Training**: スクラッチからの学習、学習済みモデルのファインチューニング、LoRAファインチューニングをサポート
 - **Multiple Inference Options**: コマンドライン、HuggingFaceフォーマット、Gradio Web UI
 
@@ -126,6 +136,14 @@ python inference_gradio.py \
     --xcodec2_sample_rate 16000 \
     --port 7860
 ```
+
+#### バッチ生成
+
+同一入力から異なるランダムサンプルで複数の音声バリエーションを並列生成できます。エンコーダは1回のみ実行されるため効率的です。
+
+- Gradio UIの**「Number of Samples」**スライダー（1〜256）で生成数を指定
+- 結果は8列のグリッドレイアウトで表示
+- 複数の候補を生成して最良のものを選択する用途に便利
 
 #### 低VRAM向けオプション（Gradio / HF推論）
 
