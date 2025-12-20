@@ -222,6 +222,10 @@ EXTRA_ARGS="--no_compile --share" docker compose up
 
 ## Training
 
+[examples/amitaro/README.md](examples/amitaro/README.md) provides a concrete LoRA fine-tuning example in Japanese using the [Amitaro Voice Material Workshop](https://amitaro.net/) dataset.
+
+Below is a general overview of the training workflow.
+
 ### Data Preprocessing
 
 Prepare training data using the preprocessing scripts. Example with Emilia-YODAS English subset:

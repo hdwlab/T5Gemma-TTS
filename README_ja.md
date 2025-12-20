@@ -220,6 +220,10 @@ EXTRA_ARGS="--no_compile --share" docker compose up
 
 ## 学習
 
+[examples/amitaro/README.md](examples/amitaro/README.md)以下に、[あみたろの声素材工房様](https://amitaro.net/)のデータセットを用いた日本語でのLoRAファインチューニングの具体例を示しています。
+
+以下は一般的な学習手順の概要です。
+
 ### データ前処理
 
 前処理スクリプトを使用して学習データを準備します。Emilia-YODASの英語サブセットの例：
