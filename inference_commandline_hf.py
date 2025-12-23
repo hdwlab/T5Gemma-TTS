@@ -39,6 +39,21 @@ def seed_everything(seed=1):
     torch.backends.cudnn.deterministic = True
 
 
+def _device_str_from_map(device_map, fallback):
+    if not device_map:
+        return fallback
+    for dev in device_map.values():
+        if dev in ("cpu", "disk"):
+            continue
+        if isinstance(dev, int):
+            return f"cuda:{dev}"
+        if isinstance(dev, torch.device):
+            return str(dev)
+        if isinstance(dev, str):
+            return dev
+    return fallback
+
+
 def run_inference(
     reference_speech=None,
     target_text="こんにちは、私はAIです。これは音声合成のテストです。",
@@ -84,8 +99,11 @@ def run_inference(
     is_quantized = getattr(model, "is_loaded_in_8bit", False) or getattr(
         model, "is_loaded_in_4bit", False
     )
-    if not is_quantized and device != "cpu":
+    has_device_map = bool(getattr(model, "hf_device_map", None))
+    if not is_quantized and device != "cpu" and not has_device_map:
         model = model.to(device)
+    if has_device_map:
+        device = _device_str_from_map(model.hf_device_map, device)
     model.eval()
     cfg = model.config
 

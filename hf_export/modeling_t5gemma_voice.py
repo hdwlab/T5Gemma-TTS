@@ -382,15 +382,19 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         self.backbone.config.use_cache = True
 
         if hasattr(self.backbone, "model"):
-            self.encoder_module = self.backbone.model.encoder
-            self.decoder_module = self.backbone.model.decoder
+            encoder_module = self.backbone.model.encoder
+            decoder_module = self.backbone.model.decoder
         else:
-            self.encoder_module = getattr(self.backbone, "encoder", None)
-            self.decoder_module = getattr(self.backbone, "decoder", None)
-        if self.encoder_module is None or self.decoder_module is None:
+            encoder_module = getattr(self.backbone, "encoder", None)
+            decoder_module = getattr(self.backbone, "decoder", None)
+        if encoder_module is None or decoder_module is None:
             raise AttributeError(
                 "Failed to locate encoder/decoder modules on T5Gemma backbone."
             )
+        # Store aliases without registering duplicate submodules. This avoids
+        # `find_tied_parameters` treating aliases as tied weights in multi-GPU.
+        object.__setattr__(self, "encoder_module", encoder_module)
+        object.__setattr__(self, "decoder_module", decoder_module)
 
         config_hidden_size = getattr(self.backbone.config, "d_model", None)
         if config_hidden_size is None:
@@ -690,6 +694,7 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         consec_silence_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         silence_set = set(silence_tokens)
+        state_device = None
 
         # Compute budgets once
         first_input_len = int(x_lens[0].item())
@@ -699,6 +704,14 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
         while not finished.all():
             logits = self.predict_layer[0](last_hidden).squeeze(1)  # [B, V]
+            if state_device is None or state_device != logits.device:
+                state_device = logits.device
+                if prev_tokens.device != state_device:
+                    prev_tokens = prev_tokens.to(state_device)
+                if consec_silence_counts.device != state_device:
+                    consec_silence_counts = consec_silence_counts.to(state_device)
+                if finished.device != state_device:
+                    finished = finished.to(state_device)
 
             effective_length = max(0, current_length - prompt_offset)
 
@@ -814,8 +827,10 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         # Stack generated tokens: [B, T_gen]
         if generated_tokens:
             generated_tensor = torch.stack(generated_tokens, dim=1)
+            gen_device = generated_tensor.device
         else:
-            generated_tensor = torch.zeros((batch_size, 0), device=device, dtype=torch.long)
+            gen_device = y.device
+            generated_tensor = torch.zeros((batch_size, 0), device=gen_device, dtype=torch.long)
 
         # Trim each sample to its actual length (up to first EOG)
         # For simplicity, keep rectangular tensor but mask with EOG
@@ -824,6 +839,8 @@ class T5GemmaVoiceForConditionalGeneration(PreTrainedModel, GenerationMixin):
         # Build result tensors
         # y is [B, 1, T_prompt], generated_tensor is [B, T_gen]
         expected_y_len = y_len + generated_tensor.shape[1]
+        if y.device != gen_device:
+            y = y.to(gen_device)
         res = torch.cat([y[:, 0, :], generated_tensor], dim=1).unsqueeze(1)  # [B, 1, T_total]
 
         if self.args.special_first:
