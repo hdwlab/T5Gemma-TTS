@@ -52,7 +52,6 @@ dependencies = [
   "pyopenjtalk",
   "pypinyin",
   "torchtune",
-  "torchao"
   "alias-free-torch",
   "vector-quantize-pytorch",
 ]
