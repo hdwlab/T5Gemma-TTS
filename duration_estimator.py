@@ -1,3 +1,5 @@
+"""Duration estimation utilities for T5Gemma TTS."""
+
 import os
 import re
 from typing import Optional, Tuple
@@ -15,6 +17,7 @@ except ImportError:
 
 try:
     import nltk
+
     nltk.download("averaged_perceptron_tagger_eng", quiet=True)
     from g2p_en import G2p
 except ImportError:
@@ -47,7 +50,15 @@ _g2p_en = None
 
 
 def _safe_detect_language(text: str) -> str:
-    """Return coarse language code: en / ja / zh / other."""
+    """Detect a coarse language code.
+
+    Args:
+        text (str): Input text to inspect.
+
+    Returns:
+        str: One of "en", "ja", "zh", or "other".
+
+    """
     text = text.strip()
     if not text:
         return "other"
@@ -82,6 +93,7 @@ def _safe_detect_language(text: str) -> str:
 
 
 def _phoneme_count_en(text: str) -> int:
+    """Estimate English phoneme count from text."""
     global _g2p_en
     if G2p is None:
         return len(text)
@@ -92,13 +104,19 @@ def _phoneme_count_en(text: str) -> int:
 
 
 def _phoneme_count_ja(text: str) -> int:
+    """Estimate Japanese phoneme count from text."""
     if pyopenjtalk is None:
         return len(text)
     ph = pyopenjtalk.g2p(text)
-    return len([p for p in ph.split(" ") if p and p not in {"pau", "sil"}])
+    if isinstance(ph, str):
+        tokens = ph.split(" ")
+    else:
+        tokens = list(ph)
+    return len([p for p in tokens if p and p not in {"pau", "sil"}])
 
 
 def _phoneme_count_zh(text: str) -> int:
+    """Estimate Chinese syllable count from text."""
     if lazy_pinyin is None or Style is None:
         return len(text)
     syllables = lazy_pinyin(text, style=Style.NORMAL, neutral_tone_with_five=True)
@@ -106,6 +124,7 @@ def _phoneme_count_zh(text: str) -> int:
 
 
 def _phoneme_count(text: str, lang: str) -> int:
+    """Estimate phoneme count for the given language."""
     if lang == "en":
         return _phoneme_count_en(text)
     if lang == "ja":
@@ -117,18 +136,25 @@ def _phoneme_count(text: str, lang: str) -> int:
 
 
 def _punctuation_bonus_sec(text: str) -> float:
-    """
-    Add small pauses for punctuation/ellipsis.
-    - Major stops inside a sentence (.,!?。！？) add more than minor stops.
+    """Compute pause bonus based on punctuation.
+
+    - Major stops inside a sentence add more than minor stops.
     - Trailing sentence-final punctuation is ignored to avoid double counting.
-    - Ellipsis (“…” or “...”) and long dash (“—”/“--”) add extra pause.
+    - Ellipsis and long dashes add extra pause.
+
+    Args:
+        text (str): Input text.
+
+    Returns:
+        float: Pause bonus in seconds.
+
     """
     t = text.strip()
     major_chars = ".!?。！？"
     minor_chars = "、，,;；:"
 
-    major = len(re.findall(r"[.!?。！？]", t))
-    minor = len(re.findall(r"[、，,;；:]", t))
+    major = len(re.findall(rf"[{major_chars}]", t))
+    minor = len(re.findall(rf"[{minor_chars}]", t))
 
     # Don’t count sentence-final major punctuation
     if t and t[-1] in major_chars:
@@ -147,16 +173,26 @@ def _punctuation_bonus_sec(text: str) -> float:
 
 
 def _clamp(val: float, bounds: Tuple[float, float]) -> float:
+    """Clamp a value to the given bounds."""
     lo, hi = bounds
     return max(lo, min(hi, val))
 
 
 def detect_language(text: str) -> str:
-    """Expose the internal detector for reuse in inference pipelines."""
+    """Expose the internal language detector for reuse.
+
+    Args:
+        text (str): Input text to inspect.
+
+    Returns:
+        str: One of "en", "ja", "zh", or "other".
+
+    """
     return _safe_detect_language(text)
 
 
 def _canonicalize_lang(lang: Optional[str]) -> Optional[str]:
+    """Normalize language code to a coarse code."""
     if not lang:
         return None
     lang = lang.lower()
@@ -176,18 +212,29 @@ def estimate_duration(
     target_lang: Optional[str] = None,
     reference_lang: Optional[str] = None,
 ) -> float:
-    """
-    Estimate target duration (seconds) using phoneme-aware pacing.
+    """Estimate target duration (seconds) using phoneme-aware pacing.
 
     - If reference audio + its transcript are available, derive seconds-per-phoneme
       from them and apply to target text.
     - Otherwise, fall back to language-specific default seconds-per-phoneme.
+
+    Args:
+        target_text (str): Target text to be synthesized.
+        reference_speech (Optional[str]): Path to reference audio for pacing.
+        reference_transcript (Optional[str]): Transcript for reference audio.
+        target_lang (Optional[str]): Language code for target text.
+        reference_lang (Optional[str]): Language code for reference transcript.
+
+    Returns:
+        float: Estimated duration in seconds.
     """
     target_text = target_text or ""
     ref_has_audio = reference_speech and os.path.isfile(reference_speech)
 
     # Language for target text (optional override to avoid repeated detection)
-    tgt_lang = _canonicalize_lang(target_lang) or (_safe_detect_language(target_text) if target_text else "en")
+    tgt_lang = _canonicalize_lang(target_lang) or (
+        _safe_detect_language(target_text) if target_text else "en"
+    )
     tgt_phonemes = max(_phoneme_count(target_text, tgt_lang), 1)
 
     spp = SPP_DEFAULT.get(tgt_lang, SPP_DEFAULT["other"])

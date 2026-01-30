@@ -40,32 +40,20 @@ dependencies = [
   "torch>=2.5.1,<=2.8.0",
   "torchaudio>=2.5.1,<=2.8.0",
   "numpy",
-  "tqdm",
-  "fire",
   "einops",
-  "omegaconf==2.3.0",
-  "torchmetrics",
-  "sentencepiece",
-  "transformers==4.57.3",
+  "transformers",
   "huggingface_hub",
-  "datasets<4",
-  "peft>=0.12.0",
-  "xcodec2 @ https://huggingface.co/NandemoGHS/Anime-XCodec2-44.1kHz-v2/resolve/main/xcodec2-0.1.7.tar.gz",
-  "ffmpeg-python",
-  "scipy",
+  "safetensors",
   "soundfile",
-  "numba>=0.60.0",
-  "librosa",
-  "tensorboard",
-  "wandb",
-  "matplotlib",
-  "gradio",
-  "torchcodec",
-  "bitsandbytes",
+  "tqdm",
   "langdetect",
+  "nltk",
   "g2p_en",
-  "pyopenjtalk-plus[onnxruntime]",
+  "pyopenjtalk",
   "pypinyin",
+  "torchtune",
+  "alias-free-torch",
+  "vector-quantize-pytorch",
 ]
 
 [project.urls]
@@ -76,7 +64,8 @@ Demo = "https://huggingface.co/spaces/Aratako/T5Gemma-TTS-Demo"
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["duration_estimator", "inference_tts_utils"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["models*", "data*", "steps*", "hf_export*"]
+include = ["data*"]

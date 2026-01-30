@@ -1,22 +1,15 @@
-import argparse
+"""Inference helpers for T5Gemma TTS."""
+
 import logging
-import os
-import pickle
-import random
 import re
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple, Union, cast
 
-import numpy as np
 import torch
 import torchaudio
-import tqdm
 
-from functools import lru_cache
-
-from data.tokenizer import AudioTokenizer, tokenize_audio, _load_audio
-from duration_estimator import detect_language
-
+from .data.tokenizer import tokenize_audio
+from .duration_estimator import detect_language
 
 # ==== PyTorch 2.9+ audio backend compatibility helpers ====
 # Starting with PyTorch 2.9, torchaudio internally depends on TorchCodec for
@@ -24,8 +17,14 @@ from duration_estimator import detect_language
 # unavailable or incompatible (e.g., DGX Spark), these helpers provide a
 # soundfile-based fallback.
 
+
 def _torch_ge_29() -> bool:
-    """Return True if PyTorch version is >= 2.9."""
+    """Check whether the installed PyTorch version is >= 2.9.
+
+    Returns:
+        bool: True if PyTorch version is >= 2.9.
+
+    """
     try:
         v = torch.__version__.split("+")[0]
         major, minor = map(int, v.split(".")[:2])
@@ -34,38 +33,57 @@ def _torch_ge_29() -> bool:
         return False
 
 
-def get_audio_info(audio_path: str):
-    """
-    Get audio file info (sample rate).
+class _AudioInfoSoundFile(Protocol):
+    """Audio info interface for soundfile backend."""
+
+    samplerate: int
+
+
+class _AudioInfoTorchAudio(Protocol):
+    """Audio info interface for torchaudio backend."""
+
+    sample_rate: int
+
+
+def get_audio_info(audio_path: str) -> Union[_AudioInfoSoundFile, _AudioInfoTorchAudio]:
+    """Get audio file info (sample rate).
+
     Returns an object with `samplerate` attribute (soundfile style).
     For PyTorch < 2.9, returns torchaudio.info result which has `sample_rate`.
+
+    Args:
+        audio_path (str): Path to the audio file.
+
+    Returns:
+        object: Audio info object from soundfile or torchaudio.
+
     """
     if _torch_ge_29():
         import soundfile as sf
+
         return sf.info(audio_path)
     else:
         return torchaudio.info(audio_path)
 
 
-def get_sample_rate(info) -> int:
-    """Extract sample rate from audio info object (works for both backends)."""
-    if hasattr(info, "samplerate"):
-        return info.samplerate
-    return info.sample_rate
+def get_sample_rate(info: Union[_AudioInfoSoundFile, _AudioInfoTorchAudio]) -> int:
+    """Extract sample rate from audio info object (works for both backends).
 
+    Args:
+        info (object): Audio info object.
 
-def save_audio(path: str, waveform: torch.Tensor, sample_rate: int) -> None:
+    Returns:
+        int: Sample rate in Hz.
+
     """
-    Save audio to file using appropriate backend.
-    For PyTorch >= 2.9, uses soundfile to avoid TorchCodec dependency.
-    """
-    if _torch_ge_29():
-        import soundfile as sf
-        # Ensure waveform is 1D or 2D numpy array
-        wav_np = waveform.squeeze().detach().cpu().numpy()
-        sf.write(path, wav_np, sample_rate)
-    else:
-        torchaudio.save(path, waveform, sample_rate)
+    sr = cast(Optional[int], getattr(info, "samplerate", None))
+    if sr is not None:
+        return sr
+    sr = cast(Optional[int], getattr(info, "sample_rate", None))
+    if sr is not None:
+        return sr
+    raise ValueError("Audio info object has no samplerate/sample_rate attribute.")
+
 
 # Text normalization (only applied when language is Japanese)
 _REPLACE_MAP = {
@@ -87,24 +105,36 @@ _FULLWIDTH_ALPHA_TO_HALFWIDTH = str.maketrans(
         for full, half in zip(
             list(range(0xFF21, 0xFF3B)) + list(range(0xFF41, 0xFF5B)),
             list(range(0x41, 0x5B)) + list(range(0x61, 0x7B)),
+            strict=True,
         )
     }
 )
 _HALFWIDTH_KATAKANA_CHARS = "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
-_FULLWIDTH_KATAKANA_CHARS = "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン"
+_FULLWIDTH_KATAKANA_CHARS = (
+    "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチ"
+    "ツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン"
+)
 _HALFWIDTH_KATAKANA_TO_FULLWIDTH = str.maketrans(
     _HALFWIDTH_KATAKANA_CHARS, _FULLWIDTH_KATAKANA_CHARS
 )
 _FULLWIDTH_DIGITS_TO_HALFWIDTH = str.maketrans(
     {
         chr(full): chr(half)
-        for full, half in zip(range(0xFF10, 0xFF1A), range(0x30, 0x3A))
+        for full, half in zip(range(0xFF10, 0xFF1A), range(0x30, 0x3A), strict=True)
     }
 )
 
 
 def _normalize_japanese_text(text: str) -> str:
-    """Mirror dataset-side normalization; used only when lang=ja."""
+    """Normalize Japanese text to match dataset conventions.
+
+    Args:
+        text (str): Input text.
+
+    Returns:
+        str: Normalized text.
+
+    """
     for pattern, replacement in _REPLACE_MAP.items():
         text = re.sub(pattern, replacement, text)
 
@@ -118,9 +148,17 @@ def _normalize_japanese_text(text: str) -> str:
 
 
 def normalize_text_with_lang(text: str, lang: Optional[str]) -> Tuple[str, Optional[str]]:
-    """
-    Normalize text if (and only if) the language is Japanese.
-    Returns normalized_text and the resolved language code to avoid re-detecting downstream.
+    """Normalize text when language is Japanese.
+
+    Returns normalized text and the resolved language code to avoid re-detecting downstream.
+
+    Args:
+        text (str): Input text.
+        lang (Optional[str]): Language code (optional).
+
+    Returns:
+        Tuple[str, Optional[str]]: Normalized text and resolved language code.
+
     """
     resolved_lang = lang.lower() if isinstance(lang, str) else None
     if not text:
@@ -132,56 +170,58 @@ def normalize_text_with_lang(text: str, lang: Optional[str]) -> Tuple[str, Optio
     return text, resolved_lang
 
 
-# this script only works for the musicgen architecture
-def get_args():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--manifest_fn", type=str, default="path/to/eval_metadata_file")
-    parser.add_argument("--audio_root", type=str, default="path/to/audio_folder")
-    parser.add_argument("--exp_dir", type=str, default="path/to/model_folder")
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--codec_audio_sr", type=int, default=16000, help='the sample rate of audio that the codec is trained for')
-    parser.add_argument("--codec_sr", type=int, default=50, help='the sample rate of the codec codes')
-    parser.add_argument("--top_k", type=int, default=0, help="sampling param")
-    parser.add_argument("--top_p", type=float, default=0.8, help="sampling param")
-    parser.add_argument("--temperature", type=float, default=1.0, help="sampling param")
-    parser.add_argument("--min_p", type=float, default=0.0, help="sampling param; 0 disables min_p filter")
-    parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--signature", type=str, default=None, help="xcodec2 model id (HF repo) if you want to override the default")
-    parser.add_argument("--crop_concat", type=int, default=0)
-    parser.add_argument("--stop_repetition", type=int, default=-1, help="used for inference, when the number of consecutive repetition of a token is bigger than this, stop it")
-    parser.add_argument("--sample_batch_size", type=int, default=1, help="batch size for sampling, NOTE that it's not running inference for several samples, but duplicate one input sample batch_size times, and during inference, we only return the shortest generation")
-    parser.add_argument("--silence_tokens", type=str, default="[]", help="silence token ids (depends on the codec vocab)")
-    return parser.parse_args()
-
-
 @torch.no_grad()
 def inference_one_sample(
-    model,
-    model_args,
-    text_tokenizer,
-    audio_tokenizer,
-    audio_fn,
-    target_text,
-    lang,
-    device,
-    decode_config,
-    prompt_end_frame,
-    target_generation_length,
-    prefix_transcript=None,
-    quiet=False,
-    repeat_prompt=0,
-    multi_trial=None,
-    return_frames=False,
+    model: Any,
+    model_args: Any,
+    text_tokenizer: Any,
+    audio_tokenizer: Any,
+    audio_fn: Optional[str],
+    target_text: str,
+    lang: Optional[str],
+    device: str,
+    decode_config: Dict[str, Any],
+    prompt_end_frame: int,
+    target_generation_length: float,
+    prefix_transcript: Optional[str] = None,
+    quiet: bool = False,
+    repeat_prompt: Union[int, str] = 0,
+    multi_trial: Optional[list] = None,
+    return_frames: bool = False,
     num_samples: int = 1,
-):
+) -> tuple:
+    """Run single-sample inference.
+
+    Args:
+        model (Any): T5Gemma TTS model instance.
+        model_args (Any): Model config/args.
+        text_tokenizer (Any): Text tokenizer.
+        audio_tokenizer (Any): Audio tokenizer.
+        audio_fn (Optional[str]): Reference audio path.
+        target_text (str): Target text to synthesize.
+        lang (Optional[str]): Language code (optional).
+        device (str): Device string (e.g., "cpu", "cuda:0").
+        decode_config (Dict[str, Any]): Decoding configuration.
+        prompt_end_frame (int): Prompt frame cutoff.
+        target_generation_length (float): Target generation length in seconds.
+        prefix_transcript (Optional[str]): Prefix transcript (optional).
+        quiet (bool): Disable logging if True.
+        repeat_prompt (Union[int, str]): Prompt repetition strategy.
+        multi_trial (Optional[list]): Multi-trial config (unused here).
+        return_frames (bool): Return codec frames if True.
+        num_samples (int): Number of samples to generate.
+
+    Returns:
+        tuple: Generated audio (and optional frames), following the original API.
+
+    """
     multi_trial = multi_trial or []
 
     # XCodec2 always uses a single codebook.
     if int(getattr(model_args, "n_codebooks", 1)) != 1:
         raise ValueError("XCodec2 backend supports only n_codebooks=1.")
     n_codebooks = 1
-    empty_token = int(getattr(model_args, "empty_token", 0))
+    # empty_token = int(getattr(model_args, "empty_token", 0))
     codec_sr = int(decode_config["codec_sr"])
     y_sep_token = getattr(model_args, "y_sep_token", None)
     x_sep_token = getattr(model_args, "x_sep_token", None)
@@ -193,11 +233,10 @@ def inference_one_sample(
     if isinstance(silence_tokens, str):
         silence_tokens = eval(silence_tokens)
 
-    has_reference_audio = (
-        audio_fn is not None and str(audio_fn).lower() not in {"", "none", "null"}
-    )
+    has_reference_audio = audio_fn is not None and str(audio_fn).lower() not in {"", "none", "null"}
 
     if has_reference_audio:
+        assert audio_fn is not None
         encoded_frames = tokenize_audio(
             audio_tokenizer,
             audio_fn,
@@ -281,7 +320,6 @@ def inference_one_sample(
         else:
             text_tokens = prefix_tokens + text_tokens
 
-
     if add_eos_token:
         text_tokens.append(add_eos_token)
     if add_bos_token:
@@ -292,22 +330,31 @@ def inference_one_sample(
 
     if not quiet:
         logging.info(
-            f"original audio length: {original_audio.shape[1]} codec frames, "
-            f"which is {original_audio.shape[1] / codec_sr:.2f} sec."
+            "original audio length: %d codec frames, which is %.2f sec.",
+            original_audio.shape[1],
+            original_audio.shape[1] / codec_sr,
         )
 
     if getattr(model_args, "parallel_pattern", 0) != 0:
-        tgt_y_lens = torch.LongTensor([int(original_audio.shape[1] + codec_sr * target_generation_length + 2)])
+        tgt_y_lens = torch.LongTensor(
+            [int(original_audio.shape[1] + codec_sr * target_generation_length + 2)]
+        )
     else:
         tgt_y_lens = torch.LongTensor(
-            [int(original_audio.shape[1] + codec_sr * target_generation_length + effective_delay_inc)]
+            [
+                int(
+                    original_audio.shape[1]
+                    + codec_sr * target_generation_length
+                    + effective_delay_inc
+                )
+            ]
         )
 
     assert decode_config["sample_batch_size"] <= 1
     stime = time.time()
     assert multi_trial == []
     if not quiet:
-        logging.info(f"running inference with num_samples={num_samples}")
+        logging.info("running inference with num_samples=%d", num_samples)
 
     concat_frames, gen_frames = model.inference_tts(
         text_tokens.to(device),
@@ -326,24 +373,31 @@ def inference_one_sample(
 
     inference_time = time.time() - stime
     num_generated_tokens = gen_frames.shape[-1]
-    tokens_per_sec = num_generated_tokens * num_samples / inference_time if inference_time > 0 else 0.0
+    tokens_per_sec = (
+        num_generated_tokens * num_samples / inference_time if inference_time > 0 else 0.0
+    )
     audio_duration = num_generated_tokens / codec_sr
     real_time_factor = audio_duration * num_samples / inference_time if inference_time > 0 else 0.0
 
     if not quiet:
-        logging.info(f"inference on {num_samples} sample(s) took: {inference_time:.4f} sec.")
+        logging.info("inference on %d sample(s) took: %.4f sec.", num_samples, inference_time)
         logging.info(
-            f"generated encoded_frames.shape: {gen_frames.shape}, "
-            f"which is {audio_duration:.2f} sec per sample."
+            "generated encoded_frames.shape: %s, which is %.2f sec per sample.",
+            gen_frames.shape,
+            audio_duration,
         )
-    print(f"[Speed] {tokens_per_sec:.2f} tokens/s | RTF: {real_time_factor:.2f}x | "
-          f"Generated {num_generated_tokens} tokens x {num_samples} samples in {inference_time:.2f}s")
+    print(
+        f"[Speed] {tokens_per_sec:.2f} tokens/s | RTF: {real_time_factor:.2f}x | "
+        f"Generated {num_generated_tokens} tokens x {num_samples} samples in {inference_time:.2f}s"
+    )
 
-    def _strip_sep_and_eos_per_sample(frames: torch.Tensor, sep_token: Optional[int], eos_token: Optional[int]):
+    def _strip_sep_and_eos_per_sample(
+        frames: torch.Tensor, sep_token: Optional[int], eos_token: Optional[int]
+    ):
         """Strip sep/eos tokens per sample, returning list of variable-length tensors."""
         results = []
         for b in range(frames.shape[0]):
-            sample_frames = frames[b:b+1]  # [1, K, T]
+            sample_frames = frames[b : b + 1]  # [1, K, T]
             mask = torch.ones_like(sample_frames, dtype=torch.bool)
             if sep_token is not None:
                 mask &= sample_frames.ne(sep_token)
@@ -377,7 +431,9 @@ def inference_one_sample(
                 concat_sample = audio_tokenizer.decode(concat_frames_list[i])
                 concat_samples.append(concat_sample)
             except Exception as exc:
-                logging.warning(f"Failed to decode concatenated prompt audio for sample {i}: {exc}")
+                logging.warning(
+                    "Failed to decode concatenated prompt audio for sample %d: %s", i, exc
+                )
                 concat_samples.append(gen_sample)
         else:
             concat_samples.append(gen_sample)
@@ -407,45 +463,3 @@ def inference_one_sample(
             [f.detach().cpu() for f in gen_frames_list],
         )
     return concat_samples, gen_samples
-
-
-# ==== Whisper transcription (transformers, MPS compatible, no ffmpeg) ====
-
-
-@lru_cache(maxsize=2)
-def get_whisper_model(device: str = "cpu"):
-    """Load and cache transformers Whisper model and processor."""
-    from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
-    model_name = "openai/whisper-large-v3-turbo"
-    print(f"[Info] Loading Whisper model ({model_name}) on {device}...")
-    processor = WhisperProcessor.from_pretrained(model_name)
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
-    model = model.to(device)
-    model.eval()
-    return model, processor
-
-
-def transcribe_audio(audio_path: str, device: str = "cpu") -> str:
-    """Transcribe audio file using transformers Whisper (no ffmpeg required)."""
-    model, processor = get_whisper_model(device)
-
-    # Load audio using shared _load_audio (handles PyTorch 2.9+ compatibility)
-    wav, sr = _load_audio(audio_path)
-    if sr != 16000:
-        wav = torchaudio.transforms.Resample(sr, 16000)(wav)
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-
-    # Prepare input features
-    input_features = processor(
-        wav.squeeze().numpy(),
-        sampling_rate=16000,
-        return_tensors="pt",
-    ).input_features.to(device)
-
-    # Generate transcription
-    with torch.no_grad():
-        predicted_ids = model.generate(input_features)
-
-    return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]

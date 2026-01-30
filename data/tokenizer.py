@@ -1,11 +1,19 @@
-from typing import Any, Optional
+"""Audio tokenizer wrapper for TTS generation (XCodec2 only)."""
+
+from typing import Any, Optional, Tuple
 
 import torch
 import torchaudio
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+
+from .xcodec2.configuration_bigcodec import BigCodecConfig
+from .xcodec2.modeling_xcodec2 import XCodec2Model
+
 
 # PyTorch 2.9+ compatibility helper
 def _torch_ge_29() -> bool:
-    """Return True if PyTorch version is >= 2.9."""
+    """Return True if the installed PyTorch version is >= 2.9."""
     try:
         v = torch.__version__.split("+")[0]
         major, minor = map(int, v.split(".")[:2])
@@ -14,19 +22,16 @@ def _torch_ge_29() -> bool:
         return False
 
 
-try:
-    from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
-    from xcodec2.configuration_bigcodec import BigCodecConfig
-    from xcodec2.modeling_xcodec2 import XCodec2Model
-
-    _HAS_XCODEC2 = True
-except ImportError:
-    _HAS_XCODEC2 = False
-
-
 class AudioTokenizer:
-    """Audio tokenizer wrapper (XCodec2 only)."""
+    """Audio tokenizer wrapper (XCodec2 only).
+
+    Args:
+        device: Torch device to run the codec on. Defaults to CUDA/MPS/CPU fallback.
+        signature: Optional model signature used as a fallback model ID.
+        backend: Backend identifier. Only "xcodec2" is supported.
+        model_name: Optional Hugging Face repo ID for the codec weights.
+        sample_rate: Optional override for the codec sample rate.
+    """
 
     def __init__(
         self,
@@ -36,6 +41,7 @@ class AudioTokenizer:
         model_name: Optional[str] = None,
         sample_rate: Optional[int] = None,
     ) -> None:
+        """Initialize the tokenizer and load codec weights."""
         if backend != "xcodec2":
             raise ValueError(f"Only xcodec2 backend is supported now (got {backend}).")
 
@@ -50,10 +56,6 @@ class AudioTokenizer:
         self.signature = signature
         self.model_name = model_name
 
-        if not _HAS_XCODEC2:
-            raise ImportError(
-                "xcodec2 module not found. Install with `pip install xcodec2` or add the bundled version to PYTHONPATH."
-            )
         model_id = model_name or signature or "NandemoGHS/Anime-XCodec2-44.1kHz-v2"
         ckpt_path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
         ckpt = {}
@@ -61,14 +63,10 @@ class AudioTokenizer:
             for k in f.keys():
                 ckpt[k.replace(".beta", ".bias")] = f.get_tensor(k)
             codec_config = BigCodecConfig.from_pretrained(model_id)
-            self.codec = XCodec2Model.from_pretrained(
-                None, config=codec_config, state_dict=ckpt
-            )
+            self.codec = XCodec2Model.from_pretrained(None, config=codec_config, state_dict=ckpt)
             self.codec.eval()
             self.codec.to(device)
-        self.sample_rate = sample_rate or None
-        if self.sample_rate is None:
-            self.sample_rate = int(getattr(self.codec.config, "sample_rate", 44100))
+        self.sample_rate: int = sample_rate or int(getattr(self.codec.config, "sample_rate", 44100))
         encode_sr = getattr(self.codec.config, "encoder_sample_rate", None)
         if encode_sr is None:
             fe = getattr(self.codec, "feature_extractor", None)
@@ -77,10 +75,19 @@ class AudioTokenizer:
         self.channels = 1
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
+        """Return the torch device used by the codec."""
         return self._device
 
     def encode(self, wav: torch.Tensor) -> torch.Tensor:
+        """Encode audio into discrete codec codes.
+
+        Args:
+            wav: Audio tensor shaped as [samples], [batch, samples], or [batch, channels, samples].
+
+        Returns:
+            Discrete codes tensor shaped as [batch, codebooks, frames].
+        """
         wav = wav.to(self.device)
         if wav.ndim == 3:
             wav = wav.squeeze(1)
@@ -93,6 +100,14 @@ class AudioTokenizer:
         return codes.to(dtype=torch.long)
 
     def decode(self, frames: torch.Tensor) -> torch.Tensor:
+        """Decode discrete codec codes into waveform audio.
+
+        Args:
+            frames: Discrete code tensor shaped as [batch, codebooks, frames] or [batch, frames].
+
+        Returns:
+            Reconstructed waveform tensor.
+        """
         codes = frames
         if codes.ndim == 2:
             codes = codes.unsqueeze(1)
@@ -100,14 +115,26 @@ class AudioTokenizer:
         recon = self.codec.decode_code(codes)
         return recon
 
-def _load_audio(audio_path: str, offset: int = -1, num_frames: int = -1):
-    """
-    Load audio file using appropriate backend.
-    For PyTorch >= 2.9 without TorchCodec, uses soundfile as fallback.
+
+def _load_audio(
+    audio_path: str, offset: int = -1, num_frames: int = -1
+) -> Tuple[torch.Tensor, int]:
+    """Load an audio file with the appropriate backend.
+
+    For PyTorch >= 2.9 without TorchCodec, uses soundfile as a fallback.
+
+    Args:
+        audio_path: Path to the audio file.
+        offset: Frame offset for partial reads. Use -1 for start.
+        num_frames: Number of frames to read. Use -1 for full file.
+
+    Returns:
+        A tuple of (waveform, sample_rate). The waveform is [channels, samples].
     """
     if _torch_ge_29():
         # Use soundfile to avoid TorchCodec dependency in PyTorch 2.9+
         import soundfile as sf
+
         info = sf.info(audio_path)
         sr = info.samplerate
 
@@ -133,7 +160,23 @@ def _load_audio(audio_path: str, offset: int = -1, num_frames: int = -1):
         return wav, sr
 
 
-def tokenize_audio(tokenizer: AudioTokenizer, audio_path: str, offset = -1, num_frames=-1):
+def tokenize_audio(
+    tokenizer: AudioTokenizer,
+    audio_path: str,
+    offset: int = -1,
+    num_frames: int = -1,
+) -> torch.Tensor:
+    """Load audio and tokenize it into discrete codec frames.
+
+    Args:
+        tokenizer: Initialized audio tokenizer instance.
+        audio_path: Path to the audio file.
+        offset: Frame offset for partial reads. Use -1 for start.
+        num_frames: Number of frames to read. Use -1 for full file.
+
+    Returns:
+        Tokenized audio codes as a tensor.
+    """
     # Load and pre-process the audio waveform
     wav, sr = _load_audio(audio_path, offset, num_frames)
     target_sr = getattr(tokenizer, "encode_sample_rate", tokenizer.sample_rate)
