@@ -64,8 +64,7 @@ Demo = "https://huggingface.co/spaces/Aratako/T5Gemma-TTS-Demo"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["duration_estimator", "inference_tts_utils"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["data*"]
+include = ["t5gemma_tts*"]
