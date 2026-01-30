@@ -220,3 +220,6 @@ datasets/
 runs/
 t5gemma_voice_hf/
 *.pth
+
+
+uv.lock

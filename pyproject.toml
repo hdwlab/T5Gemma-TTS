@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t5gemma-tts"
+version = "0.1.0"
+description = "Multilingual text-to-speech with T5Gemma encoder-decoder LLMs"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Chihiro Arata" },
+]
+keywords = [
+  "tts",
+  "text-to-speech",
+  "audio",
+  "speech",
+  "multilingual",
+  "pytorch",
+  "llm",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core dependencies (mirrors requirements.txt)
+dependencies = [
+  "torch>=2.5.1,<=2.8.0",
+  "torchaudio>=2.5.1,<=2.8.0",
+  "numpy",
+  "tqdm",
+  "fire",
+  "einops",
+  "omegaconf==2.3.0",
+  "torchmetrics",
+  "sentencepiece",
+  "transformers==4.57.3",
+  "huggingface_hub",
+  "datasets<4",
+  "peft>=0.12.0",
+  "xcodec2 @ https://huggingface.co/NandemoGHS/Anime-XCodec2-44.1kHz-v2/resolve/main/xcodec2-0.1.7.tar.gz",
+  "ffmpeg-python",
+  "scipy",
+  "soundfile",
+  "numba>=0.60.0",
+  "librosa",
+  "tensorboard",
+  "wandb",
+  "matplotlib",
+  "gradio",
+  "torchcodec",
+  "bitsandbytes",
+  "langdetect",
+  "g2p_en",
+  "pyopenjtalk-plus[onnxruntime]",
+  "pypinyin",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aratako/T5Gemma-TTS"
+Repository = "https://github.com/Aratako/T5Gemma-TTS"
+Model = "https://huggingface.co/Aratako/T5Gemma-TTS-2b-2b"
+Demo = "https://huggingface.co/spaces/Aratako/T5Gemma-TTS-Demo"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "data*", "steps*", "hf_export*"]
