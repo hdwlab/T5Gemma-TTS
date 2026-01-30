@@ -54,6 +54,7 @@ dependencies = [
   "torchtune",
   "alias-free-torch",
   "vector-quantize-pytorch",
+  "torchao",
 ]
 
 [project.urls]
