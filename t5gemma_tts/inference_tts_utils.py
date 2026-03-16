@@ -386,10 +386,10 @@ def inference_one_sample(
             gen_frames.shape,
             audio_duration,
         )
-    print(
-        f"[Speed] {tokens_per_sec:.2f} tokens/s | RTF: {real_time_factor:.2f}x | "
-        f"Generated {num_generated_tokens} tokens x {num_samples} samples in {inference_time:.2f}s"
-    )
+        print(
+            f"[Speed] {tokens_per_sec:.2f} tokens/s | RTF: {real_time_factor:.2f}x | "
+            f"Generated {num_generated_tokens} tokens x {num_samples} samples in {inference_time:.2f}s"
+        )
 
     def _strip_sep_and_eos_per_sample(
         frames: torch.Tensor, sep_token: Optional[int], eos_token: Optional[int]
